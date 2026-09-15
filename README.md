@@ -4,6 +4,78 @@
 mongoexport/mongosh），与 `js/` 参考实现**同真值**（同 seed 集合上 overall、delta
 明细、退出码一致）。
 
+## 快速开始（三步走）
+
+**第 1 步：安装依赖**（Ubuntu/Debian 为例，其他发行版把 apt 换成 yum/dnf 即可）
+
+```bash
+sudo apt-get update && sudo apt-get install -y bash jq coreutils
+# mongosh 与 mongoexport（mongodb-database-tools）不在发行版仓库，去官方下载页取对应平台包：
+#   mongosh:                https://www.mongodb.com/try/download/shell
+#   database-tools(含 mongoexport): https://www.mongodb.com/try/download/database-tools
+# 例（Ubuntu amd64，版本号请按下载页最新替换）：
+# sudo dpkg -i mongosh-2.x.x-linux-x64.deb mongodb-database-tools-ubuntu2204-x86_64-100.x.x.deb
+```
+
+**第 2 步：跑第一次比对**（整条命令可直接复制，替换 URI 里的主机/账号即可）
+
+```bash
+bin/mongo-dbcheck.sh \
+  --src "mongodb://user:pass@host1:27020/admin" \
+  --dst "mongodb://user:pass@host2:27021/admin" \
+  --level schema,index,count,hash,diff --buckets 8 --out report
+echo "exit=$?"   # 0 全一致 / 1 有差异 / 2 运行错误
+```
+
+**第 3 步：看结果**——打开 `report/summary.json`：
+
+| 字段 | 含义 |
+|---|---|
+| `overall` | 三态总判定：`equal` 全一致 / `diff` 有差异 / `error` 有运行错误 |
+| `counts.equal` / `counts.diff` | 一致 / 有差异的集合个数（error 单独计数，不入 diff） |
+| `counts.ttlSkip` | TTL 集合自动跳过数据比对的个数（仅比索引结构） |
+| `collections[].checks.hash` | 该集合分桶哈希：`buckets` 总桶数、`mismatch` 不一致桶数 |
+| `collections[].checks.diff.count` | 该集合不一致文档条数 |
+
+有差异时逐条明细看 `report/diff/<db>.<coll>.ndjson`（每行一个 `_id`，
+`type`=missing/modified，`fields` 精确到叶子路径），样例见下节。
+
+## 真实输出样例（验收环境实跑截取）
+
+`summary.json` 关键片段（11 集合、8 桶、并发 4，两端埋有差异种子）：
+
+```json
+{
+  "overall": "diff",
+  "counts": { "equal": 5, "diff": 5, "error": 0, "ttlSkip": 1 },
+  "collections": [
+    { "db": "md_data", "coll": "eq.float",  "overall": "equal",
+      "checks": { "hash": { "buckets": 8, "mismatch": 0 }, "diff": { "count": 0 } } },
+    { "db": "md_data", "coll": "diff.array", "overall": "diff",
+      "checks": { "hash": { "buckets": 8, "mismatch": 3 }, "diff": { "count": 3 } } }
+  ]
+}
+```
+
+对应 `diff/md_data.diff.array.ndjson`（字段级明细，`v.2` 即数组下标路径）：
+
+```json
+{"_id":{"$numberInt":"1"},"type":"modified","fields":[{"key":"v.0","type":"modified"},{"key":"v.2","type":"modified"}]}
+{"_id":{"$numberInt":"2"},"type":"modified","fields":[{"key":"v","type":"modified"}]}
+{"_id":{"$numberInt":"4"},"type":"modified","fields":[{"key":"v.1","type":"missing-in-b"}]}
+```
+
+字段缺失方向示例（`diff/md_data.diff.missing.ndjson`，`missing-in-a`=源侧缺、
+`missing-in-b`=目标侧缺）：
+
+```json
+{"_id":{"$numberInt":"1"},"type":"modified","fields":[{"key":"v","type":"missing-in-a"}]}
+{"_id":{"$numberInt":"2"},"type":"modified","fields":[{"key":"v","type":"missing-in-b"}]}
+{"_id":{"$numberInt":"3"},"type":"modified","fields":[{"key":"a.c","type":"missing-in-a"}]}
+```
+
+该次运行退出码 `1`（有差异，与 `overall:"diff"` 一致）。
+
 ## 架构与类型保真
 
 BSON 的 int32/double/long/decimal 必须可区分。shell 版的保真路径：
@@ -103,11 +175,32 @@ Node + 官方驱动（`promoteValues:false`）+ 驱动游标流式处理，性�
 
 ## 测试
 
-- `test/units-shell.sh`：jq 归一化/叶子 diff 单测（15 项，离线）
-- `test/gap-regression.sh`：末桶边界 off-by-one 回归用例（需 `MD_SRC_URI`/`MD_DST_URI`
-  可写的测试库；构造 `_id∈[bounds[N-1], max)` 的 modified 文档断言检出，自建自清
-  `__gap_test` 集合；已验证对旧 bug 为 FAIL、修复后 PASS）
-- `test/validate-canonical.js`：JS 版对 seed 回归（50 项，需 `MD_SRC_URI`/`MD_DST_URI`）
+**① jq 单测（离线，无需数据库，装好 jq 即可跑）**
+
+```bash
+test/units-shell.sh        # 期望输出：==== RESULT: pass=15 fail=0 ====
+```
+
+**② 末桶边界回归（需两端可写测试库，自建自清 `__gap_test` 集合）**
+
+```bash
+export MD_SRC_URI="mongodb://user:pass@host1:27020/admin"
+export MD_DST_URI="mongodb://user:pass@host2:27021/admin"
+test/gap-regression.sh     # 期望末行：PASS: gap-zone modified docs (80,99) + control (10) all detected
+```
+
+**③ JS 版 seed 回归（50 项，与 shell 版同真值基准；需 node + 依赖）**
+
+```bash
+export MD_SRC_URI="mongodb://user:pass@host1:27020/admin"
+export MD_DST_URI="mongodb://user:pass@host2:27021/admin"
+node test/validate-canonical.js
+```
+
+回归用例背景：`test/gap-regression.sh` 防的是历史上出现过的末桶
+off-by-one（`_id∈[bounds[N-1], max)` 区间漏检），构造 4 桶 0..100、在危险区
+80/99 + 对照 10 埋 modified，断言 3 条全检出（已验证对旧 bug 为 FAIL、修复后
+PASS）。
 
 ## 目录
 

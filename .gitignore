@@ -1,0 +1,8 @@
+node_modules/
+report*/
+*.log
+clierr.txt
+clilog.txt
+err*.txt
+resume_err.txt
+.checkpoints/
